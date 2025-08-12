@@ -1,0 +1,326 @@
+# Jenkins CI/CD + OpenShift Spring Boot 应用部署配置
+# 演示 Jenkins 构建 -> Nexus 镜像仓库 -> OpenShift 部署的完整流程
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: spring-boot-demo
+  labels:
+    name: spring-boot-demo
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: spring-boot-sa
+  namespace: spring-boot-demo
+---
+# Nexus 镜像仓库 Secret (用于拉取私有镜像)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: nexus-registry-secret
+  namespace: spring-boot-demo
+type: kubernetes.io/dockerconfigjson
+data:
+  # 示例：base64 编码的 Docker 配置
+  # 包含 Nexus 仓库的认证信息
+  .dockerconfigjson: ewoJImF1dGhzIjogewoJCSJuZXh1cy5leGFtcGxlLmNvbSI6IHt9Cgl9Cn0=
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spring-boot-config
+  namespace: spring-boot-demo
+data:
+  application.yml: |
+    spring:
+      application:
+        name: spring-boot-demo
+      profiles:
+        active: openshift
+    server:
+      port: 8080
+    logging:
+      level:
+        root: INFO
+        com.example: DEBUG
+    management:
+      endpoints:
+        web:
+          exposure:
+            include: health,info,metrics,prometheus
+      endpoint:
+        health:
+          show-details: always
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: spring-boot-secret
+  namespace: spring-boot-demo
+type: Opaque
+data:
+  # 示例密钥 (base64 编码)
+  database-password: cGFzc3dvcmQxMjM=  # password123
+  api-key: bXktYXBpLWtleQ==  # my-api-key
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spring-boot-app
+  namespace: spring-boot-demo
+  labels:
+    app: spring-boot-app
+    version: v1
+  annotations:
+    # 部署注解，用于跟踪部署信息
+    deployment.kubernetes.io/revision: "1"
+    openshift.io/deployment-config.latest-version: "1"
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: spring-boot-app
+  template:
+    metadata:
+      labels:
+        app: spring-boot-app
+        version: v1
+      annotations:
+        # 部署时间戳
+        deployment.kubernetes.io/deployment-timestamp: "2024-01-01T00:00:00Z"
+    spec:
+      # 使用 Nexus 镜像仓库认证
+      imagePullSecrets:
+      - name: nexus-registry-secret
+      serviceAccountName: spring-boot-sa
+      containers:
+      - name: spring-boot-container
+        # 从 Nexus 镜像仓库拉取镜像
+        image: nexus.example.com:8082/spring-boot-app:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+          name: http
+        env:
+        - name: SPRING_PROFILES_ACTIVE
+          value: "openshift"
+        - name: SERVER_PORT
+          value: "8080"
+        - name: JAVA_OPTS
+          value: "-Xms512m -Xmx1024m -XX:+UseG1GC -XX:+UseContainerSupport"
+        - name: DATABASE_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: spring-boot-secret
+              key: database-password
+        - name: API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: spring-boot-secret
+              key: api-key
+        # 构建信息环境变量
+        - name: BUILD_VERSION
+          value: "1.0.0"
+        - name: BUILD_DATE
+          value: "2024-01-01T00:00:00Z"
+        - name: GIT_COMMIT
+          value: "abc123def456"
+        volumeMounts:
+        - name: config-volume
+          mountPath: /app/config
+        - name: logs-volume
+          mountPath: /app/logs
+        - name: reports-volume
+          mountPath: /app/reports
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /actuator/health
+            port: 8080
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /actuator/health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        # 启动探针 (OpenShift 4.7+)
+        startupProbe:
+          httpGet:
+            path: /actuator/health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 30
+      volumes:
+      - name: config-volume
+        configMap:
+          name: spring-boot-config
+      - name: logs-volume
+        emptyDir: {}
+      - name: reports-volume
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spring-boot-service
+  namespace: spring-boot-demo
+  labels:
+    app: spring-boot-app
+spec:
+  type: ClusterIP
+  ports:
+  - port: 80
+    targetPort: 8080
+    protocol: TCP
+    name: http
+  selector:
+    app: spring-boot-app
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: spring-boot-route
+  namespace: spring-boot-demo
+  labels:
+    app: spring-boot-app
+  annotations:
+    # 路由注解
+    openshift.io/host.generated: "true"
+spec:
+  host: spring-boot-app.apps.openshift.example.com
+  to:
+    kind: Service
+    name: spring-boot-service
+    weight: 100
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: spring-boot-hpa
+  namespace: spring-boot-demo
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: spring-boot-app
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: spring-boot-monitor
+  namespace: spring-boot-demo
+  labels:
+    app: spring-boot-app
+spec:
+  selector:
+    matchLabels:
+      app: spring-boot-app
+  endpoints:
+  - port: http
+    path: /actuator/prometheus
+    interval: 30s
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: spring-boot-network-policy
+  namespace: spring-boot-demo
+spec:
+  podSelector:
+    matchLabels:
+      app: spring-boot-app
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: spring-boot-demo
+    ports:
+    - protocol: TCP
+      port: 8080
+  egress:
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: TCP
+      port: 53
+    - protocol: UDP
+      port: 53
+---
+# 镜像流配置 (可选，用于 OpenShift 内部镜像管理)
+apiVersion: image.openshift.io/v1
+kind: ImageStream
+metadata:
+  name: spring-boot-app
+  namespace: spring-boot-demo
+spec:
+  lookupPolicy:
+    local: true
+  tags:
+  - name: latest
+    from:
+      kind: DockerImage
+      name: nexus.example.com:8082/spring-boot-app:latest
+    importPolicy:
+      scheduled: true
+---
+# 构建配置 (可选，用于 OpenShift 内部构建)
+apiVersion: build.openshift.io/v1
+kind: BuildConfig
+metadata:
+  name: spring-boot-app
+  namespace: spring-boot-demo
+spec:
+  output:
+    to:
+      kind: ImageStreamTag
+      name: spring-boot-app:latest
+  source:
+    git:
+      uri: https://github.com/your-org/spring-boot-app.git
+      ref: master
+    contextDir: .
+  strategy:
+    type: Docker
+    dockerStrategy:
+      dockerfilePath: CICD/dockerfile.yml
+  triggers:
+  - type: ConfigChange
+  - type: ImageChange 

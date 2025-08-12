@@ -1,0 +1,123 @@
+pipeline {
+    agent any
+    
+    environment {
+        PROJECT_NAME = 'spring-boot-app'
+        NEXUS_REGISTRY = 'nexus.example.com:8082'
+        OPENSHIFT_PROJECT = 'spring-boot-demo'
+        BUILD_VERSION = "${env.BUILD_NUMBER}"
+        GIT_COMMIT = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+        IMAGE_TAG = "${env.BUILD_NUMBER}-${env.GIT_COMMIT}"
+        IMAGE_NAME = "${NEXUS_REGISTRY}/${PROJECT_NAME}:${IMAGE_TAG}"
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                echo "检出代码..."
+                checkout scm
+            }
+        }
+        
+        stage('Build & Test') {
+            steps {
+                echo "构建和测试..."
+                sh 'mvn clean compile test'
+                sh 'mvn jacoco:prepare-agent test jacoco:report'
+                sh 'mvn package -DskipTests'
+            }
+            post {
+                always {
+                    publishTestResults testResultsPattern: '**/surefire-reports/*.xml'
+                    publishCoverage adapters: [jacocoAdapter('**/target/site/jacoco/jacoco.xml')]
+                }
+            }
+        }
+        
+        stage('SonarQube Analysis') {
+            steps {
+                echo "SonarQube 代码质量分析..."
+                withCredentials([string(credentialsId: 'sonar-credentials', variable: 'SONAR_TOKEN')]) {
+                    sh """
+                        mvn sonar:sonar \
+                            -Dsonar.host.url=http://sonarqube.example.com:9000 \
+                            -Dsonar.login=${SONAR_TOKEN} \
+                            -Dsonar.projectKey=${PROJECT_NAME}
+                    """
+                }
+            }
+        }
+        
+        stage('Quality Gate') {
+            steps {
+                echo "检查质量门禁..."
+                timeout(time: 10, unit: 'MINUTES') {
+                    withCredentials([string(credentialsId: 'sonar-credentials', variable: 'SONAR_TOKEN')]) {
+                        script {
+                            def qualityGate = sh(
+                                script: "curl -s -u ${SONAR_TOKEN}: http://sonarqube.example.com:9000/api/qualitygates/project_status?projectKey=${PROJECT_NAME} | jq -r '.projectStatus.status'",
+                                returnStdout: true
+                            ).trim()
+                            
+                            if (qualityGate != 'OK') {
+                                error "质量门禁未通过: ${qualityGate}"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Build Docker Image') {
+            steps {
+                echo "构建 Docker 镜像..."
+                docker.build("${IMAGE_NAME}")
+            }
+        }
+        
+        stage('Push to Nexus') {
+            steps {
+                echo "推送镜像到 Nexus..."
+                withCredentials([usernamePassword(credentialsId: 'nexus-credentials', usernameVariable: 'NEXUS_USER', passwordVariable: 'NEXUS_PASS')]) {
+                    sh "docker login ${NEXUS_REGISTRY} -u ${NEXUS_USER} -p ${NEXUS_PASS}"
+                    sh "docker push ${IMAGE_NAME}"
+                    sh "docker tag ${IMAGE_NAME} ${NEXUS_REGISTRY}/${PROJECT_NAME}:latest"
+                    sh "docker push ${NEXUS_REGISTRY}/${PROJECT_NAME}:latest"
+                }
+            }
+        }
+        
+        stage('Deploy to OpenShift') {
+            steps {
+                echo "部署到 OpenShift..."
+                withCredentials([usernamePassword(credentialsId: 'openshift-credentials', usernameVariable: 'OC_USER', passwordVariable: 'OC_PASS')]) {
+                    sh "oc login --token=${OC_PASS} --server=${OC_SERVER}"
+                    sh "oc project ${OPENSHIFT_PROJECT}"
+                    sh "oc patch deployment spring-boot-app -p '{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"spring-boot-container\",\"image\":\"${IMAGE_NAME}\"}]}}}}'"
+                    sh "oc rollout status deployment/spring-boot-app --timeout=300s"
+                }
+            }
+        }
+        
+        stage('Integration Test') {
+            steps {
+                echo "集成测试..."
+                sleep(time: 30, unit: 'SECONDS')
+                sh "oc get route spring-boot-route -o jsonpath='{.spec.host}' | xargs -I {} curl -f https://{}/actuator/health"
+            }
+        }
+    }
+    
+    post {
+        always {
+            sh "docker rmi ${IMAGE_NAME} || true"
+            cleanWs()
+        }
+        success {
+            echo "构建成功！"
+        }
+        failure {
+            echo "构建失败！"
+        }
+    }
+} 

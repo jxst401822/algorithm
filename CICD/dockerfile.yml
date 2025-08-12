@@ -1,0 +1,160 @@
+# Jenkins CI/CD + OpenShift Spring Boot 应用部署 Dockerfile
+# 演示 Jenkins 构建 -> Nexus 镜像仓库 -> OpenShift 部署的完整流程
+
+# 阶段1: 构建和测试阶段 (Build & Test Stage)
+# Jenkins 将在此阶段执行构建、测试、代码质量检测
+FROM openjdk:11-jdk-slim AS builder
+
+# 设置工作目录
+WORKDIR /app
+
+# 安装必要的工具
+RUN apt-get update && apt-get install -y \
+    curl \
+    wget \
+    unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+# 复制 Maven 配置文件
+COPY pom.xml .
+COPY mvnw .
+COPY .mvn .mvn
+
+# 复制源代码
+COPY src ./src
+
+# 设置 Maven 环境变量
+ENV MAVEN_OPTS="-Xmx2048m -XX:MaxPermSize=512m"
+
+# 阶段1.1: 依赖下载 (Dependency Resolution)
+# 预下载依赖，利用 Docker 层缓存
+RUN ./mvnw dependency:go-offline -B
+
+# 阶段1.2: 编译和单元测试 (Compile & Unit Tests)
+RUN ./mvnw clean compile test-compile
+
+# 阶段1.3: 运行单元测试 (Unit Tests)
+RUN ./mvnw test
+
+# 阶段1.4: 代码覆盖率检测 (JaCoCo Coverage)
+RUN ./mvnw jacoco:prepare-agent test jacoco:report
+
+# 阶段1.5: 代码质量检测 (SonarQube Analysis)
+# 注意：实际使用时需要配置 SONAR_TOKEN 环境变量
+ARG SONAR_TOKEN
+ARG SONAR_HOST_URL
+RUN if [ -n "$SONAR_TOKEN" ] && [ -n "$SONAR_HOST_URL" ]; then \
+        ./mvnw sonar:sonar \
+            -Dsonar.host.url=$SONAR_HOST_URL \
+            -Dsonar.login=$SONAR_TOKEN \
+            -Dsonar.projectKey=spring-boot-app \
+            -Dsonar.projectName="Spring Boot Application" \
+            -Dsonar.projectVersion=1.0.0 \
+            -Dsonar.sources=src/main/java \
+            -Dsonar.tests=src/test/java \
+            -Dsonar.java.binaries=target/classes \
+            -Dsonar.java.test.binaries=target/test-classes \
+            -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml \
+            -Dsonar.junit.reportsPath=target/surefire-reports; \
+    else \
+        echo "SonarQube analysis skipped - SONAR_TOKEN or SONAR_HOST_URL not provided"; \
+    fi
+
+# 阶段1.6: 集成测试 (Integration Tests)
+RUN ./mvnw verify -DskipUnitTests=true
+
+# 阶段1.7: 打包应用 (Package Application)
+RUN ./mvnw package -DskipTests
+
+# 阶段2: 镜像构建阶段 (Image Build Stage)
+# 使用多阶段构建来优化镜像大小
+FROM openjdk:11-jre-slim
+
+# 设置应用用户 (OpenShift 安全最佳实践)
+USER 1001
+
+# 设置工作目录
+WORKDIR /app
+
+# 从构建阶段复制 JAR 文件
+COPY --from=builder /app/target/*.jar app.jar
+
+# 复制测试报告和覆盖率报告 (可选，用于调试)
+COPY --from=builder /app/target/surefire-reports ./reports/surefire-reports
+COPY --from=builder /app/target/site/jacoco ./reports/jacoco
+
+# 暴露应用端口
+EXPOSE 8080
+
+# 设置 JVM 参数 (OpenShift 环境优化)
+ENV JAVA_OPTS="-Xms512m -Xmx1024m -XX:+UseG1GC -XX:+UseContainerSupport"
+
+# 健康检查端点
+HEALTHCHECK --interval=30s --timeout=3s --start-period=60s --retries=3 \
+  CMD curl -f http://localhost:8080/actuator/health || exit 1
+
+# 启动应用
+ENTRYPOINT ["sh", "-c", "java $JAVA_OPTS -jar app.jar"]
+
+# 阶段3: OpenShift 特定配置
+# 这些是 OpenShift 部署时需要的额外配置
+
+# 标签 (Labels) - OpenShift 资源管理
+LABEL io.openshift.tags="java,spring-boot"
+LABEL io.k8s.display-name="Spring Boot Application"
+LABEL io.openshift.expose-services="8080:http"
+LABEL org.opencontainers.image.source="https://github.com/your-org/spring-boot-app"
+LABEL org.opencontainers.image.version="${BUILD_VERSION:-latest}"
+LABEL org.opencontainers.image.created="${BUILD_DATE:-unknown}"
+
+# 环境变量配置
+ENV SPRING_PROFILES_ACTIVE=openshift
+ENV SERVER_PORT=8080
+
+# 卷挂载点 (如果需要持久化存储)
+VOLUME ["/app/logs", "/app/config", "/app/reports"]
+
+# 阶段4: 安全配置
+# OpenShift 安全上下文配置
+USER 1001:1001
+
+# 设置文件权限
+RUN chmod 755 /app/app.jar
+
+# 阶段5: 网络配置
+# 配置应用监听的网络接口
+ENV BIND_ADDRESS=0.0.0.0
+
+# 阶段6: 日志配置
+# 配置日志输出到标准输出 (OpenShift 日志聚合)
+ENV LOGGING_LEVEL_ROOT=INFO
+ENV LOGGING_PATTERN_CONSOLE="%d{yyyy-MM-dd HH:mm:ss} - %msg%n"
+
+# 阶段7: 监控配置
+# 启用 Spring Boot Actuator 端点
+ENV MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE=health,info,metrics,prometheus
+ENV MANAGEMENT_ENDPOINT_HEALTH_SHOW-DETAILS=always
+
+# 阶段8: 资源限制配置
+# 设置容器资源限制 (OpenShift 资源管理)
+# 这些值在 OpenShift 部署配置中设置
+# resources:
+#   requests:
+#     memory: "512Mi"
+#     cpu: "250m"
+#   limits:
+#     memory: "1Gi"
+#     cpu: "500m"
+
+# 阶段9: 服务发现配置
+# 配置服务发现和负载均衡
+ENV SPRING_CLOUD_KUBERNETES_ENABLED=true
+ENV SPRING_CLOUD_KUBERNETES_CONFIG_ENABLED=true
+
+# 阶段10: 配置管理
+# 支持外部配置 (ConfigMaps 和 Secrets)
+ENV SPRING_CONFIG_IMPORT=optional:configtree:/app/config/
+
+# 最终配置
+# 确保应用在容器中正确运行
+CMD ["java", "-jar", "/app/app.jar"]
